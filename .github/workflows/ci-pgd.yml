@@ -1,0 +1,113 @@
+name: ci-pgd
+
+on:
+  push:
+    branches:
+      - ci/pgd-l2-random-start-batch
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            torch: "2.9.0"
+            python: "3.11"
+          - variant: fixed
+            torch: "2.9.0"
+            python: "3.11"
+          - variant: fixed
+            torch: "2.3.0"
+            python: "3.10"
+    name: tests-${{ matrix.variant }}-torch${{ matrix.torch }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: |
+          pip install --progress-bar off torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
+          pip install --progress-bar off "numpy<2" -e ".[test]" scikit-learn
+      - name: Revert source fix (baseline only)
+        if: matrix.variant == 'baseline'
+        run: |
+          git checkout HEAD~2 -- captum/robust/_core/pgd.py
+          git diff --stat HEAD
+      - name: New test
+        continue-on-error: ${{ matrix.variant == 'baseline' }}
+        run: python -m pytest -ra -v tests/robust/test_PGD.py::Test::test_attack_random_start_l2_batched
+      - name: Probe each shape separately
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import torch
+          from captum.robust import PGD
+          from captum.testing.helpers.basic_models import BasicModel
+          adv = PGD(BasicModel())
+          for shape in ((4, 3), (3, 3), (2, 3, 8, 8)):
+              torch.manual_seed(1)
+              inp = torch.randn(shape)
+              torch.manual_seed(0)
+              direction = torch.randn_like(inp).view(shape[0], -1)
+              torch.manual_seed(0)
+              try:
+                  out = adv.perturb(inp, 0.25, 0.1, 0, 0, norm="L2", random_start=True)
+              except Exception as e:
+                  print(shape, "ERROR", type(e).__name__, e)
+                  continue
+              delta = (out - inp).view(shape[0], -1)
+              print(shape, "norms", delta.norm(dim=1).tolist(),
+                    "cos", torch.cosine_similarity(delta, direction, dim=1).tolist())
+          PY
+      - name: New test with only the (3, 3) shape
+        continue-on-error: ${{ matrix.variant == 'baseline' }}
+        run: |
+          sed -i 's/for shape in ((4, 3), (3, 3), (2, 3, 8, 8)):/for shape in ((3, 3),):/' tests/robust/test_PGD.py
+          grep -n "for shape in" tests/robust/test_PGD.py
+          python -m pytest -ra tests/robust/test_PGD.py::Test::test_attack_random_start_l2_batched 2>&1 | grep -E "^E |passed|failed"
+          git checkout -- tests/robust/test_PGD.py
+      - name: tests/robust
+        run: python -m pytest -ra tests/robust
+      - name: Full test suite (fixed, latest torch)
+        if: matrix.variant == 'fixed' && matrix.torch == '2.9.0'
+        run: python -m pytest -ra -q -p no:cacheprovider tests
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          pip install --progress-bar off torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install --progress-bar off -e ".[dev]" ipython
+      - name: ufmt
+        run: ufmt check . || (ufmt diff . && exit 1)
+      - name: flake8
+        run: flake8
+      - name: pyrefly (fixed)
+        run: |
+          pyrefly --version
+          pyrefly check captum \
+            --project-excludes='**/fb/**' \
+            --python-version=3.10 \
+            --permissive-ignores \
+            --untyped-def-behavior=check-and-infer-return-any
+      - name: pyrefly summary (fixed vs baseline)
+        if: always()
+        run: |
+          echo "== fixed"; pyrefly check captum --project-excludes='**/fb/**' --python-version=3.10 --permissive-ignores --untyped-def-behavior=check-and-infer-return-any 2>&1 | grep -E "INFO|pgd" || true
+          git checkout HEAD~2 -- captum/robust/_core/pgd.py
+          echo "== baseline"; pyrefly check captum --project-excludes='**/fb/**' --python-version=3.10 --permissive-ignores --untyped-def-behavior=check-and-infer-return-any 2>&1 | grep -E "INFO|pgd" || true
+          git checkout HEAD -- captum/robust/_core/pgd.py
+      - name: sphinx
+        run: sphinx-build -WT --keep-going sphinx/source sphinx/build
