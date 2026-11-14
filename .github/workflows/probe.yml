@@ -1,0 +1,24 @@
+name: probe
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [pypi, main]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+      - if: matrix.src == 'pypi'
+        run: pip install captum
+      - if: matrix.src == 'main'
+        run: pip install "git+https://github.com/meta-pytorch/captum.git@master"
+      - run: pip show captum | head -3
+      - run: for f in probe_*.py; do echo "=== $f"; python $f; done
